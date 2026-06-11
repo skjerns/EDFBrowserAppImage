@@ -1,0 +1,121 @@
+name: Build AppImage
+
+on:
+  workflow_dispatch:            # manual run -> ALWAYS builds and releases
+  schedule:
+    - cron: '0 4 1 * *'         # monthly (1st, 04:00 UTC) -> builds only if upstream version increased
+
+permissions:
+  contents: write               # required to read + create/update releases
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Cheap gate: fetch only upstream global.h, compare its PROGRAM_VERSION to the
+  # latest published release. Manual runs always proceed; scheduled runs only
+  # proceed when upstream is strictly newer (or nothing has been released yet).
+  # ---------------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - name: Read upstream version
+        id: upstream
+        run: |
+          v="$(curl -fsSL https://gitlab.com/Teuniz/EDFbrowser/-/raw/master/global.h \
+                 | grep '#define PROGRAM_VERSION' \
+                 | grep -oE '[0-9]+\.[0-9]+[A-Za-z0-9.]*' | head -1)"
+          [ -n "$v" ] || { echo "could not read upstream version" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Upstream PROGRAM_VERSION: $v"
+
+      - name: Read latest released version
+        id: released
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Latest release tag: ${tag:-<none>}"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          UPSTREAM: ${{ steps.upstream.outputs.version }}
+          RELEASED_TAG: ${{ steps.released.outputs.tag }}
+        run: |
+          released="${RELEASED_TAG#v}"
+          echo "version=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "Manual run -> always build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$released" ]; then
+            echo "No prior release -> build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          newest="$(printf '%s\n%s\n' "$released" "$UPSTREAM" | sort -V | tail -1)"
+          if [ "$UPSTREAM" != "$released" ] && [ "$newest" = "$UPSTREAM" ]; then
+            echo "Upstream $UPSTREAM is newer than released $released -> build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Released $released is up to date with upstream $UPSTREAM -> skip."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Full build on Ubuntu 22.04 (glibc 2.35 floor) -> publish the AppImage.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout packaging scripts
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential g++ make git wget file imagemagick \
+            qtbase5-dev qtbase5-dev-tools libgl-dev libicu-dev
+
+      - name: Build AppImage (fresh upstream clone)
+        run: ./ci-build.sh
+
+      - name: Determine version
+        id: ver
+        run: |
+          v="$(ls EDFbrowser-*-x86_64.AppImage | sed -E 's/^EDFbrowser-(.*)-x86_64\.AppImage$/\1/')"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EDFbrowser-${{ steps.ver.outputs.version }}-x86_64.AppImage
+          path: EDFbrowser-*-x86_64.AppImage
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: EDFbrowser ${{ steps.ver.outputs.version }}
+          files: EDFbrowser-*-x86_64.AppImage
+          fail_on_unmatched_files: true
+          body: |
+            EDFbrowser ${{ steps.ver.outputs.version }} — x86_64 AppImage, built from upstream source
+            (https://gitlab.com/Teuniz/EDFbrowser).
+
+            **Requirements:** glibc >= 2.35 (Ubuntu 22.04+, Debian 12+, Fedora 36+, or any newer
+            distro) and FUSE. On systems without FUSE, run it with `--appimage-extract-and-run`.
+
+            ```
+            chmod +x EDFbrowser-${{ steps.ver.outputs.version }}-x86_64.AppImage
+            ./EDFbrowser-${{ steps.ver.outputs.version }}-x86_64.AppImage
+            ```
